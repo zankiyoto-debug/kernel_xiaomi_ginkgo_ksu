@@ -14,7 +14,9 @@
 #   - Auto-handle Kconfig choice (matikan CONFIG_KSU_NONE jika ada) + opsi ThinLTO
 #   - AnyKernel3 ZIP standar osm0sis (`rm -rf .git` + `zip -r9 -n .gz:.gz-dtb`) agar 100% lolos TWRP/OrangeFox
 # ==============================================================================
+
 name: Build Ginkgo Android 16 Brutal Kernel (v4.1 FlopUnity + KSUN 3.4.0)
+
 on:
   workflow_dispatch:
     inputs:
@@ -40,3 +42,936 @@ on:
         required: false
         default: ""
       ksu_mode:
+        description: "Mode KernelSU-Next (ksun-v3.4.0-legacy-manual = RESEP TERBUKTI 33294)"
+        type: choice
+        required: true
+        default: "ksun-v3.4.0-legacy-manual"
+        options:
+          - ksun-v3.4.0-legacy-manual
+          - keep-existing
+          - none
+      clang_version:
+        description: "Compiler AOSP Clang (r547379 = Clang 20.0.0 identik kernel jalan di HP-mu!)"
+        type: choice
+        required: true
+        default: "aosp-clang20-r547379"
+        options:
+          - aosp-clang20-r547379
+          - aosp-clang21-r563880
+          - custom-url
+      custom_clang_url:
+        description: "URL .tar.gz/.tar.xz Clang (hanya jika clang_version = custom-url)"
+        required: false
+        default: ""
+      kernel_hz:
+        description: "Kernel Timer Tick Rate (250 = rekomendasi FlopKernel 2.5x lebih responsif; 100 = stock Infinity X)"
+        type: choice
+        required: true
+        default: "250"
+        options:
+          - "250"
+          - "300"
+          - "100"
+      inject_brutal_flags:
+        description: "Aktifkan TCP BBR/BBR2 + FQ + LZ4 ZRAM + Writeback + OverlayFS + BORE/MGLRU (jika ada)"
+        type: boolean
+        default: true
+      enable_thinlto:
+        description: "Aktifkan LLVM ThinLTO (lebih cepat di runtime, tapi build pertama sedikit lebih lama)"
+        type: boolean
+        default: false
+      gpu_oc_profile:
+        description: "GPU Adreno 610 OC+UV (Build #1 WAJIB stock-950 dulu! Build #2 baru oc-1050-uv / oc-1100-uv)"
+        type: choice
+        required: true
+        default: "stock-950"
+        options:
+          - stock-950
+          - oc-1050-uv
+          - oc-1100-uv
+      tianma_display_hz:
+        description: "Display OC Panel Tianma NT36672A (Build #1 WAJIB 60! Build #2 pilih 65 atau maks 66 Hz)"
+        type: choice
+        required: true
+        default: "60"
+        options:
+          - "60"
+          - "65"
+          - "66"
+      update_dtb_in_zip:
+        description: "Update DTB saat flash ZIP (auto = stock DTB jika non-OC, update DTB otomatis jika GPU/Display OC aktif)"
+        type: choice
+        required: true
+        default: "auto"
+        options:
+          - auto
+          - always
+          - kernel-only
+      localversion:
+        description: "LOCALVERSION kernel (pertahankan -openela-perf-g44758a7220f2 agar vermagic modul 100% cocok ROM)"
+        required: true
+        default: "-openela-perf-g44758a7220f2"
+      use_ccache:
+        description: "Aktifkan ccache (build ke-2 dst jauh lebih cepat ~4-6 menit)"
+        type: boolean
+        default: true
+
+jobs:
+  build-ginkgo-flopunity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: "[1/12] Checkout Source Kernel (FlopKernel floppy-unity)"
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.kernel_source_repo }}
+          ref: ${{ inputs.kernel_source_branch }}
+          fetch-depth: 1
+
+      - name: "[2/12] Verifikasi Tree Kernel & Manual Hook KernelSU (Anti Salah Repo!)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== Source: ${{ inputs.kernel_source_repo }} @ ${{ inputs.kernel_source_branch }} ==="
+          head -n 6 Makefile
+          if [ ! -f "Makefile" ] || [ ! -d "arch/arm64" ]; then
+            echo "::error::Repo bukan Linux ARM64 kernel tree!"
+            exit 1
+          fi
+          if [ "${{ inputs.ksu_mode }}" != "none" ]; then
+            echo "--- Verifikasi Manual Hook KSU di fs/ ---"
+            if ! grep -rnE "ksu_handle_execveat|ksu_handle_faccessat|ksu_handle_stat|CONFIG_KSU" fs/ | head -n 10; then
+              echo "::error::Tree kernel ini TIDAK memiliki manual hook KernelSU di fs/! Pastikan kernel_source_repo = FlopKernel-Series/flop_trinket-mi_kernel (branch: floppy-unity)."
+              exit 1
+            fi
+          fi
+
+      - name: "[3/12] Bebaskan Disk & Install Dependensi (+ dwarves/pahole + External DTC)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache cpio curl device-tree-compiler dwarves file flex git kmod \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            libelf-dev libncurses-dev libssl-dev lld llvm python3 python-is-python3 \
+            tar u-boot-tools xz-utils zip zstd
+          dtc --version
+          pahole --version || true
+
+      - name: "[4/12] Setup ccache"
+        if: ${{ inputs.use_ccache }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-ginkgo-v4-${{ inputs.clang_version }}-${{ github.sha }}
+          restore-keys: |
+            ccache-ginkgo-v4-${{ inputs.clang_version }}-
+            ccache-ginkgo-v4-
+
+      - name: "[5/12] Download AOSP Clang 20 (r547379) & GCC ARM32 4.9 (vdso32)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/clang" "$HOME/tools"
+
+          download_aosp_clang() {
+            local ver="$1"
+            local url_main="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${ver}.tar.gz"
+            local url_k="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main-kernel/${ver}.tar.gz"
+            echo "Trying primary AOSP URL: $url_main"
+            if curl -fL --retry 3 --retry-delay 5 "$url_main" -o /tmp/clang.archive; then
+              return 0
+            fi
+            echo "Primary failed, trying main-kernel branch: $url_k"
+            curl -fL --retry 3 --retry-delay 5 "$url_k" -o /tmp/clang.archive
+          }
+
+          case "${{ inputs.clang_version }}" in
+            aosp-clang20-r547379)
+              download_aosp_clang "clang-r547379"
+              ;;
+            aosp-clang21-r563880)
+              download_aosp_clang "clang-r563880"
+              ;;
+            custom-url)
+              URL="${{ inputs.custom_clang_url }}"
+              if [ -z "$URL" ]; then
+                echo "::error::custom_clang_url kosong!"
+                exit 1
+              fi
+              curl -fL --retry 3 --retry-delay 5 "$URL" -o /tmp/clang.archive
+              ;;
+          esac
+
+          tar -xf /tmp/clang.archive -C "$HOME/clang"
+          rm -f /tmp/clang.archive
+
+          if [ -x "$HOME/clang/bin/clang" ]; then
+            CLANG_BIN_DIR="$HOME/clang/bin"
+          else
+            FOUND_BIN=$(find "$HOME/clang" -maxdepth 3 -type f -name clang -path "*/bin/clang" | head -n 1 || true)
+            if [ -z "$FOUND_BIN" ]; then
+              echo "::error::bin/clang tidak ditemukan setelah ekstrak!"
+              exit 1
+            fi
+            CLANG_BIN_DIR="$(dirname "$FOUND_BIN")"
+          fi
+          echo "CLANG_BIN_DIR=$CLANG_BIN_DIR" >> "$GITHUB_ENV"
+          "$CLANG_BIN_DIR/clang" --version
+
+          # GCC ARM32 4.9 khusus untuk vdso32 Linux 4.14 (sesuai resep FlashHouseLab)
+          if git clone --depth=1 https://github.com/KudProject/arm-linux-androideabi-4.9.git "$HOME/gcc32"; then
+            echo "ARM32_PREFIX=$HOME/gcc32/bin/arm-linux-androideabi-" >> "$GITHUB_ENV"
+            "$HOME/gcc32/bin/arm-linux-androideabi-gcc" --version | head -n 1
+          else
+            echo "::warning::Clone GCC ARM32 4.9 gagal, fallback ke arm-linux-gnueabi- bawaan Ubuntu."
+            echo "ARM32_PREFIX=arm-linux-gnueabi-" >> "$GITHUB_ENV"
+          fi
+
+          # mkdtboimg.py untuk membungkus DTBO jika diperlukan
+          curl -fL --retry 3 "https://android.googlesource.com/platform/system/libufdt/+/refs/heads/main/utils/src/mkdtboimg.py?format=TEXT" \
+            | base64 -d > "$HOME/tools/mkdtboimg.py"
+          chmod +x "$HOME/tools/mkdtboimg.py"
+
+      - name: "[6/12] Integrasi KernelSU-Next v3.4.0-legacy (Full Git Clone = 33294) & 3 Patch Wajib"
+        shell: bash
+        run: |
+          set -euo pipefail
+          MODE="${{ inputs.ksu_mode }}"
+          echo "=== KernelSU Mode: $MODE ==="
+
+          if [ "$MODE" = "ksun-v3.4.0-legacy-manual" ]; then
+            KSUN_REPO="$HOME/KernelSU-Next"
+            rm -rf "$KSUN_REPO"
+            # WAJIB FULL CLONE (TANPA --depth=1) agar KSU_VERSION terhitung presisi = 33294!
+            git clone https://github.com/KernelSU-Next/KernelSU-Next.git "$KSUN_REPO"
+            git -C "$KSUN_REPO" checkout v3.4.0-legacy
+            COMMIT_CNT=$(git -C "$KSUN_REPO" rev-list --count HEAD)
+            echo "KernelSU-Next v3.4.0-legacy commit count: $COMMIT_CNT"
+
+            echo "--- Inspeksi drivers/Makefile & drivers/Kconfig sebelum integrasi ---"
+            grep -n -iE 'ksu|kernelsu' drivers/Makefile drivers/Kconfig || true
+
+            # Deteksi jalur KSU_NEXT yang mungkin sudah ada di FlopKernel floppy-unity
+            KSU_SUBDIR=$(python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          mk = Path("drivers/Makefile").read_text(errors="ignore")
+          # Cek apakah floppy-unity sudah punya baris khusus CONFIG_KSU_NEXT
+          m = re.search(r'obj-\$\(CONFIG_KSU_NEXT\)\s*\+=\s*([A-Za-z0-9_.-]+)/', mk)
+          if m:
+              print(m.group(1))
+          else:
+              m2 = re.search(r'obj-\$\(CONFIG_KSU\)\s*\+=\s*([A-Za-z0-9_.-]+)/', mk)
+              print(m2.group(1) if m2 else "kernelsu")
+          PY
+            )
+            echo "Target KSU subdir di drivers/: $KSU_SUBDIR"
+
+            rm -rf "drivers/$KSU_SUBDIR"
+            ln -s "$KSUN_REPO/kernel" "drivers/$KSU_SUBDIR"
+
+            # Pastikan drivers/Makefile memuat subdir tersebut
+            if ! grep -qE "obj-\\\$\(CONFIG_KSU(_NEXT)?\).*${KSU_SUBDIR}/" drivers/Makefile; then
+              printf '\nobj-$(CONFIG_KSU) += %s/\n' "$KSU_SUBDIR" >> drivers/Makefile
+            fi
+
+            # Pastikan drivers/Kconfig menyertakan Kconfig milik KSUN tanpa duplikat
+            if ! grep -q "drivers/${KSU_SUBDIR}/Kconfig" drivers/Kconfig; then
+              python3 - "$KSU_SUBDIR" <<'PY'
+          import sys
+          from pathlib import Path
+          subdir = sys.argv[1]
+          p = Path("drivers/Kconfig")
+          txt = p.read_text()
+          line = f'source "drivers/{subdir}/Kconfig"\n'
+          idx = txt.rfind("endmenu")
+          if idx != -1:
+              txt = txt[:idx] + line + txt[idx:]
+          else:
+              txt += "\n" + line
+          p.write_text(txt)
+          PY
+            fi
+
+            # PATCH WAJIB #1 (FlashHouseLab): sulog/event.c Linux < 4.19
+            # get_monotonic_boottime() -> get_monotonic_boottime64()
+            EVENT_C="$KSUN_REPO/kernel/sulog/event.c"
+            if [ -f "$EVENT_C" ]; then
+              sed -i 's/\bget_monotonic_boottime(/get_monotonic_boottime64(/g' "$EVENT_C"
+              echo "--- Verifikasi Patch #1 (sulog/event.c) ---"
+              grep -n "get_monotonic_boottime" "$EVENT_C" || true
+            fi
+
+            echo "--- Verifikasi drivers/Makefile & drivers/Kconfig sesudah integrasi ---"
+            grep -n -iE 'ksu|kernelsu' drivers/Makefile drivers/Kconfig || true
+          fi
+
+          # PATCH WAJIB #2 (FlashHouseLab / Clang 20): include <asm/setup.h> di fs/proc/cmdline.c
+          if [ -f "fs/proc/cmdline.c" ] && ! grep -q "<asm/setup.h>" fs/proc/cmdline.c; then
+            python3 - <<'PY'
+          from pathlib import Path
+          p = Path("fs/proc/cmdline.c")
+          lines = p.read_text().splitlines(keepends=True)
+          out = []
+          inserted = False
+          for ln in lines:
+              out.append(ln)
+              if not inserted and ln.startswith("#include <linux/"):
+                  out.append("#include <asm/setup.h>\n")
+                  inserted = True
+          if not inserted:
+              out.insert(0, "#include <asm/setup.h>\n")
+          p.write_text("".join(out))
+          PY
+            echo "--- Verifikasi Patch #2 (fs/proc/cmdline.c) ---"
+            git diff fs/proc/cmdline.c || true
+          fi
+
+          # PATCH WAJIB #3 (FlashHouseLab / Clang 20): stub () -> (void) di include/linux/battery_saver.h
+          if [ -f "include/linux/battery_saver.h" ]; then
+            python3 - <<'PY'
+          import re
+          from pathlib import Path
+          p = Path("include/linux/battery_saver.h")
+          orig = p.read_text()
+          # Hanya ubah deklarasi/definisi fungsi C berparameter kosong () -> (void)
+          patched = re.sub(
+              r'(\b(?:static\s+inline|inline|extern|void|bool|int|unsigned\s+\w+)\s+[A-Za-z_][A-Za-z0-9_*\s]*?\b[A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)',
+              r'\1(void)',
+              orig,
+          )
+          if patched != orig:
+              p.write_text(patched)
+              print("Patched include/linux/battery_saver.h successfully.")
+          else:
+              print("include/linux/battery_saver.h already Clang 20 compliant.")
+          PY
+            echo "--- Verifikasi Patch #3 (include/linux/battery_saver.h) ---"
+            git diff include/linux/battery_saver.h || true
+          fi
+
+      - name: "[7/12] Opsional: Patch GPU Adreno 610 OC + UV (1050 / 1100 MHz)"
+        if: ${{ inputs.gpu_oc_profile != 'stock-950' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROFILE="${{ inputs.gpu_oc_profile }}"
+          echo "=== Menerapkan GPU OC+UV Profile: $PROFILE ==="
+
+          python3 - "$PROFILE" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          profile = sys.argv[1]
+          max_freq = 1050000000 if profile == "oc-1050-uv" else 1100000000
+
+          # 1. Patch drivers/clk/qcom/gpucc-trinket.c
+          gpucc = Path("drivers/clk/qcom/gpucc-trinket.c")
+          if not gpucc.exists():
+              raise SystemExit("ERROR: drivers/clk/qcom/gpucc-trinket.c tidak ditemukan!")
+          src = gpucc.read_text()
+
+          # Tambahkan 1050 MHz (dan 1100 MHz jika oc-1100-uv) memakai PLL0_OUT_AUX2 divider=1
+          # (VCO tetap 1050/1100 MHz — 100% dalam rentang sah 1000-2000 MHz!)
+          def patch_ftbl(m):
+              block = m.group(0)
+              if "1050000000" not in block:
+                  insert_lines = "\tF(1050000000, P_GPU_CC_PLL0_OUT_AUX2, 1, 0, 0),\n"
+                  if max_freq >= 1100000000:
+                      insert_lines += "\tF(1100000000, P_GPU_CC_PLL0_OUT_AUX2, 1, 0, 0),\n"
+                  block, cnt = re.subn(
+                      r'([ \t]*F\(950000000,[^\n]+\n)',
+                      r'\1' + insert_lines,
+                      block,
+                      count=1,
+                  )
+                  if cnt != 1:
+                      raise SystemExit("ERROR: Baris F(950000000, ...) tidak ditemukan di ftbl_gpu_cc_gx_gfx3d_clk_src!")
+              elif max_freq >= 1100000000 and "1100000000" not in block:
+                  block, cnt = re.subn(
+                      r'([ \t]*F\(1050000000,[^\n]+\n)',
+                      r'\1\tF(1100000000, P_GPU_CC_PLL0_OUT_AUX2, 1, 0, 0),\n',
+                      block,
+                      count=1,
+                  )
+                  if cnt != 1:
+                      raise SystemExit("ERROR: Baris F(1050000000, ...) tidak ditemukan di ftbl_gpu_cc_gx_gfx3d_clk_src!")
+              return block
+
+          new_src, n1 = re.subn(
+              r'static const struct freq_tbl ftbl_gpu_cc_gx_gfx3d_clk_src\[\]\s*=\s*\{.*?\};',
+              patch_ftbl,
+              src,
+              count=1,
+              flags=re.S,
+          )
+          if n1 != 1:
+              raise SystemExit("ERROR: ftbl_gpu_cc_gx_gfx3d_clk_src tidak ditemukan di gpucc-trinket.c!")
+
+          # Update rate_max di gpu_cc_gx_gfx3d_clk_src:
+          # GPU UV: VDD_NOMINAL_L1 -> 950 MHz; GPU OC: VDD_HIGH -> 1050 / 1100 MHz
+          def patch_rcg(m):
+              blk = m.group(0)
+              blk = re.sub(r'(\[VDD_NOMINAL_L1\]\s*=\s*)\d+', r'\g<1>950000000', blk)
+              blk, ch = re.subn(r'(\[VDD_HIGH\]\s*=\s*)\d+', rf'\g<1>{max_freq}', blk)
+              if ch == 0:
+                  raise SystemExit("ERROR: [VDD_HIGH] tidak ditemukan di gpu_cc_gx_gfx3d_clk_src!")
+              return blk
+
+          new_src, n2 = re.subn(
+              r'static struct clk_rcg2 gpu_cc_gx_gfx3d_clk_src\s*=\s*\{.*?\n\};',
+              patch_rcg,
+              new_src,
+              count=1,
+              flags=re.S,
+          )
+          if n2 != 1:
+              raise SystemExit("ERROR: gpu_cc_gx_gfx3d_clk_src tidak ditemukan di gpucc-trinket.c!")
+
+          gpucc.write_text(new_src)
+
+          # 2. Patch trinket-gpu.dtsi (cari otomatis & pakai brace-counting parser agar bebas masalah indentasi)
+          dts_root = Path("arch/arm64/boot/dts")
+          gpu_dts_files = [
+              f for f in sorted(dts_root.rglob("*.dts*"))
+              if "qcom,gpu-pwrlevel-0" in f.read_text(errors="ignore")
+              and "950000000" in f.read_text(errors="ignore")
+          ]
+          if not gpu_dts_files:
+              raise SystemExit("ERROR: File DTSI GPU dengan qcom,gpu-pwrlevel-0 & 950000000 tidak ditemukan!")
+
+          # Pertahankan tepat 7 level aktif + 1 sleep (0 Hz) = 8 level total agar index initial/throttle tetap 100% sah
+          if profile == "oc-1050-uv":
+              target_freqs = [1050000000, 950000000, 820000000, 745000000, 600000000, 465000000, 320000000]
+          else:
+              target_freqs = [1100000000, 1050000000, 950000000, 820000000, 745000000, 600000000, 465000000]
+
+          def patch_pwrlevels_block(blk):
+              if "950000000" not in blk:
+                  return blk, False
+              changed = False
+              for idx, freq in enumerate(target_freqs):
+                  pat = rf'(qcom,gpu-pwrlevel-{idx}\s*\{{[^}}]*?qcom,gpu-freq\s*=\s*<)\d+(>;)'
+                  blk, c = re.subn(pat, rf'\g<1>{freq}\g<2>', blk, count=1, flags=re.S)
+                  if c:
+                      changed = True
+                  if freq >= 1050000000:
+                      def boost_bus(pm):
+                          pb = pm.group(0)
+                          pb = re.sub(r'(qcom,bus-freq\s*=\s*<)\d+(>;)', r'\g<1>11\g<2>', pb)
+                          pb = re.sub(r'(qcom,bus-min\s*=\s*<)\d+(>;)', r'\g<1>11\g<2>', pb)
+                          pb = re.sub(r'(qcom,bus-max\s*=\s*<)\d+(>;)', r'\g<1>11\g<2>', pb)
+                          return pb
+                      blk = re.sub(
+                          rf'qcom,gpu-pwrlevel-{idx}\s*\{{[^}}]*?\}};',
+                          boost_bus,
+                          blk,
+                          count=1,
+                          flags=re.S,
+                      )
+              return blk, changed
+
+          def replace_brace_blocks(text, header_re):
+              out = []
+              pos = 0
+              patched_any = False
+              for m in re.finditer(header_re, text):
+                  if m.start() < pos:
+                      continue
+                  brace_start = text.find("{", m.start())
+                  depth = 0
+                  end = brace_start
+                  while end < len(text):
+                      ch = text[end]
+                      if ch == "{":
+                          depth += 1
+                      elif ch == "}":
+                          depth -= 1
+                          if depth == 0:
+                              end += 1
+                              if end < len(text) and text[end] == ";":
+                                  end += 1
+                              break
+                      end += 1
+                  out.append(text[pos:m.start()])
+                  new_blk, chg = patch_pwrlevels_block(text[m.start():end])
+                  if chg:
+                      patched_any = True
+                  out.append(new_blk)
+                  pos = end
+              out.append(text[pos:])
+              return "".join(out), patched_any
+
+          total_dts_patched = 0
+          for dts in gpu_dts_files:
+              txt = dts.read_text()
+              txt = re.sub(r'^([ \t]*)(qcom,gpu-gaming-bin;)', r'\1/* \2 -- unlocked by GinkgoBrutal */', txt, flags=re.M)
+              txt, ok = replace_brace_blocks(txt, r'qcom,gpu-pwrlevels(?:-\d+)?\s*\{')
+              if ok:
+                  dts.write_text(txt)
+                  total_dts_patched += 1
+                  print(f"Patched GPU DTSI: {dts}")
+
+          if total_dts_patched == 0:
+              raise SystemExit("ERROR: Tidak ada blok qcom,gpu-pwrlevels yang berhasil di-patch!")
+          PY
+
+          git diff drivers/clk/qcom/gpucc-trinket.c arch/arm64/boot/dts/
+
+      - name: "[8/12] Opsional: Patch Display OC Khusus Panel Tianma NT36672A (65 / 66 Hz)"
+        if: ${{ inputs.tianma_display_hz != '60' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET_HZ="${{ inputs.tianma_display_hz }}"
+          echo "=== Menerapkan Tianma NT36672A Display OC: ${TARGET_HZ} Hz ==="
+
+          python3 - "$TARGET_HZ" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          hz = int(sys.argv[1])
+          if hz not in (65, 66):
+              raise SystemExit(f"ERROR: Target Hz tidak didukung untuk Tianma NT36672A: {hz}")
+
+          dts_root = Path("arch/arm64/boot/dts")
+          matched_files = []
+          for f in sorted(dts_root.rglob("*.dts*")):
+              name_l = f.name.lower()
+              txt = f.read_text(errors="ignore")
+              if ("nt36672a" in name_l and "tianma" in name_l) or "dsi_nt36672a_tianma_vid" in txt:
+                  if "qcom,mdss-dsi-panel-framerate" in txt:
+                      matched_files.append(f)
+
+          if not matched_files:
+              raise SystemExit("ERROR: File DTSI panel dsi_nt36672a_tianma_vid tidak ditemukan!")
+
+          for f in matched_files:
+              txt = f.read_text()
+              new_txt = re.sub(
+                  r'(qcom,mdss-dsi-panel-framerate\s*=\s*<)60(>;)',
+                  rf'\g<1>{hz}\g<2>',
+                  txt,
+              )
+
+              # Skala proporsional bitclock / panel-clockrate jika diset eksplisit (hindari DSI underrun!)
+              def scale_clk(m):
+                  prefix, val_s, suffix = m.group(1), m.group(2), m.group(3)
+                  val = int(val_s)
+                  if val > 0:
+                      new_val = int(round(val * hz / 60.0))
+                      return f"{prefix}{new_val}{suffix}"
+                  return m.group(0)
+
+              new_txt = re.sub(
+                  r'(qcom,mdss-dsi-panel-clockrate\s*=\s*<)(\d+)(>;)',
+                  scale_clk,
+                  new_txt,
+              )
+              new_txt = re.sub(
+                  r'(qcom,mdss-dsi-bitclock-frequency\s*=\s*<)(\d+)(>;)',
+                  scale_clk,
+                  new_txt,
+              )
+              if new_txt != txt:
+                  f.write_text(new_txt)
+                  print(f"Patched Tianma panel DTSI ({hz} Hz): {f}")
+          PY
+
+          git diff arch/arm64/boot/dts/
+
+      - name: "[9/12] Resolusi Defconfig (FlopKernel Auto / Infinity X Stock Dump)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          MODE="${{ inputs.defconfig_mode }}"
+          CFG_LIST=""
+          MERGED="arch/arm64/configs/ginkgo_brutal_merged_defconfig"
+
+          echo "--- Daftar config ginkgo/trinket/floppy yang tersedia ---"
+          find arch/arm64/configs -type f \( -iname "*ginkgo*" -o -iname "*trinket*" -o -iname "*floppy*" \) | sort || true
+
+          if [ "$MODE" = "infinityx-stock-file" ]; then
+            if [ -f "arch/arm64/configs/infinityx_ginkgo_defconfig" ]; then
+              cp -f arch/arm64/configs/infinityx_ginkgo_defconfig "$MERGED"
+              CFG_LIST="infinityx_ginkgo_defconfig"
+            elif [ -f "infinityx_ginkgo_defconfig" ]; then
+              cp -f infinityx_ginkgo_defconfig "$MERGED"
+              CFG_LIST="infinityx_ginkgo_defconfig (root)"
+            else
+              echo "::error::Mode infinityx-stock-file dipilih tetapi arch/arm64/configs/infinityx_ginkgo_defconfig tidak ditemukan!"
+              exit 1
+            fi
+          elif [ "$MODE" = "custom" ]; then
+            CFG_LIST="${{ inputs.custom_defconfig }}"
+            if [ -z "$CFG_LIST" ]; then
+              echo "::error::custom_defconfig kosong!"
+              exit 1
+            fi
+          else
+            # floppy-auto: deteksi layout defconfig FlopKernel floppy-unity untuk ginkgo
+            if [ -f "arch/arm64/configs/vendor/trinket-perf_defconfig" ] && [ -f "arch/arm64/configs/vendor/ginkgo.config" ]; then
+              CFG_LIST="vendor/trinket-perf_defconfig"
+              [ -f "arch/arm64/configs/vendor/xiaomi-trinket.config" ] && CFG_LIST="$CFG_LIST vendor/xiaomi-trinket.config"
+              [ -f "arch/arm64/configs/vendor/floppy.config" ] && CFG_LIST="$CFG_LIST vendor/floppy.config"
+              CFG_LIST="$CFG_LIST vendor/ginkgo.config"
+            else
+              for cand in \
+                "vendor/ginkgo-perf_defconfig" \
+                "vendor/ginkgo_defconfig" \
+                "ginkgo-perf_defconfig" \
+                "ginkgo_defconfig" \
+                "vendor/trinket-perf_defconfig"; do
+                if [ -f "arch/arm64/configs/$cand" ]; then
+                  CFG_LIST="$cand"
+                  break
+                fi
+              done
+            fi
+          fi
+
+          if [ "$MODE" != "infinityx-stock-file" ]; then
+            if [ -z "$CFG_LIST" ]; then
+              echo "::error::Defconfig ginkgo tidak ditemukan!"
+              exit 1
+            fi
+            : > "$MERGED"
+            for item in $CFG_LIST; do
+              if [ ! -f "arch/arm64/configs/$item" ]; then
+                echo "::error::File config tidak ditemukan: arch/arm64/configs/$item"
+                exit 1
+              fi
+              echo "# --- from $item ---" >> "$MERGED"
+              cat "arch/arm64/configs/$item" >> "$MERGED"
+              echo "" >> "$MERGED"
+            done
+          fi
+
+          echo "MERGED_SOURCES=$CFG_LIST" >> "$GITHUB_ENV"
+          echo "RESOLVED_DEFCONFIG=ginkgo_brutal_merged_defconfig" >> "$GITHUB_ENV"
+          echo "Merged defconfig sources: $CFG_LIST"
+
+      - name: "[10/12] Terapkan Konfigurasi Exact FlashHouseLab + Brutal Creator Flags"
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$CLANG_BIN_DIR:$PATH"
+
+          MAKE_ARGS=(
+            O=out
+            ARCH=arm64
+            CC=clang
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            DTC_EXT="$(which dtc)"
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32="$ARM32_PREFIX"
+            CROSS_COMPILE_COMPAT="$ARM32_PREFIX"
+          )
+
+          echo ">>> Step 1: Generating base out/.config ..."
+          make "${MAKE_ARGS[@]}" "$RESOLVED_DEFCONFIG"
+
+          SC="scripts/config --file out/.config"
+
+          # Identitas & kompatibilitas modul bawaan ROM (Resep FlashHouseLab)
+          $SC --set-str CONFIG_LOCALVERSION "${{ inputs.localversion }}"
+          $SC --disable CONFIG_LOCALVERSION_AUTO
+          $SC --disable CONFIG_MODULE_SIG_FORCE
+          $SC --enable CONFIG_MODVERSIONS
+          $SC --enable CONFIG_IKCONFIG
+          $SC --enable CONFIG_IKCONFIG_PROC
+
+          # KernelSU-Next Manual Hook (WAJIB KPROBES=n untuk Linux 4.14 + Android 16!)
+          if [ "${{ inputs.ksu_mode }}" = "none" ]; then
+            $SC --disable CONFIG_KSU
+            $SC --disable CONFIG_KSU_NEXT
+            $SC --disable CONFIG_KSU_SUKI
+            $SC --disable CONFIG_KSU_XXKSU
+            $SC --disable CONFIG_KSU_BAKASU
+          else
+            $SC --disable CONFIG_KSU_NONE
+            $SC --enable CONFIG_KSU
+            $SC --enable CONFIG_KSU_NEXT
+            $SC --disable CONFIG_KSU_SUKI
+            $SC --disable CONFIG_KSU_XXKSU
+            $SC --disable CONFIG_KSU_BAKASU
+            $SC --enable CONFIG_KSU_MANUAL_HOOK
+            $SC --disable CONFIG_KPROBES
+            $SC --disable CONFIG_KPROBE_EVENTS
+            $SC --enable CONFIG_OVERLAY_FS
+          fi
+
+          # LLVM ThinLTO (opsional)
+          if [ "${{ inputs.enable_thinlto }}" = "true" ]; then
+            $SC --disable CONFIG_LTO_NONE
+            $SC --enable CONFIG_LTO
+            $SC --enable CONFIG_LTO_CLANG
+            $SC --enable CONFIG_THINLTO
+          fi
+
+          # Kernel Tick Rate (100 / 250 / 300 Hz)
+          $SC --disable CONFIG_HZ_100
+          $SC --disable CONFIG_HZ_250
+          $SC --disable CONFIG_HZ_300
+          $SC --disable CONFIG_HZ_1000
+          case "${{ inputs.kernel_hz }}" in
+            100) $SC --enable CONFIG_HZ_100 ;;
+            250) $SC --enable CONFIG_HZ_250 ;;
+            300) $SC --enable CONFIG_HZ_300 ;;
+          esac
+
+          # Flag Performa Brutal Creator (TCP BBR/BBR2 + FQ + LZ4 ZRAM + BORE/MGLRU jika ada)
+          if [ "${{ inputs.inject_brutal_flags }}" = "true" ]; then
+            $SC --enable CONFIG_TCP_CONG_ADVANCED
+            $SC --enable CONFIG_TCP_CONG_BBR
+            $SC --enable CONFIG_NET_SCH_FQ
+            $SC --enable CONFIG_NET_SCH_FQ_CODEL
+            if grep -rq "config TCP_CONG_BBR2" net/ipv4/; then
+              $SC --enable CONFIG_TCP_CONG_BBR2
+            fi
+            $SC --enable CONFIG_DEFAULT_BBR
+            $SC --set-str CONFIG_DEFAULT_TCP_CONG "bbr"
+            $SC --enable CONFIG_ZRAM
+            $SC --enable CONFIG_CRYPTO_LZ4
+            $SC --enable CONFIG_ZRAM_WRITEBACK
+            $SC --enable CONFIG_OVERLAY_FS
+            if grep -rq "config SCHED_BORE" kernel/sched/ init/; then
+              $SC --enable CONFIG_SCHED_BORE
+            fi
+            if grep -rq "config LRU_GEN" mm/; then
+              $SC --enable CONFIG_LRU_GEN
+              $SC --enable CONFIG_LRU_GEN_ENABLED
+            fi
+          fi
+
+          echo ">>> Step 2: Resolving dependencies via olddefconfig ..."
+          make "${MAKE_ARGS[@]}" olddefconfig
+
+          echo "=== Verifikasi Final out/.config ==="
+          grep -E 'CONFIG_LOCALVERSION|CONFIG_KSU|CONFIG_KPROBES|CONFIG_HZ=|CONFIG_MODULE_SIG_FORCE|CONFIG_MODVERSIONS|CONFIG_TCP_CONG_BBR|CONFIG_DEFAULT_TCP_CONG|CONFIG_ZRAM|CONFIG_SCHED_BORE|CONFIG_LTO' out/.config || true
+
+          if [ "${{ inputs.ksu_mode }}" != "none" ]; then
+            grep -q "^CONFIG_KSU=y$" out/.config || { echo "::error::CONFIG_KSU=y tidak aktif setelah olddefconfig!"; exit 1; }
+            if grep -rq "config KSU_NEXT" drivers/ Kconfig init/ security/ 2>/dev/null; then
+              grep -q "^CONFIG_KSU_NEXT=y$" out/.config || { echo "::error::CONFIG_KSU_NEXT=y tidak aktif — manual hook FlopKernel bisa mati!"; exit 1; }
+            fi
+            if grep -q "^CONFIG_KPROBES=y$" out/.config; then
+              echo "::error::CONFIG_KPROBES=y masih aktif — berbahaya untuk 4.14 + Android 16!"
+              exit 1
+            fi
+          fi
+
+      - name: "[11/12] Compile Kernel ARM64 SM6125 (Image.gz-dtb + dtbs + dtbo)"
+        shell: bash
+        env:
+          ARCH: arm64
+          SUBARCH: arm64
+          KBUILD_BUILD_USER: ginkgo-brutal
+          KBUILD_BUILD_HOST: github-actions
+        run: |
+          set -euo pipefail
+          export PATH="$CLANG_BIN_DIR:$PATH"
+          if [ "${{ inputs.use_ccache }}" = "true" ]; then
+            export CCACHE_DIR="$HOME/.ccache"
+            ccache -M 4G
+            CC_CMD="ccache clang"
+          else
+            CC_CMD="clang"
+          fi
+
+          MAKE_ARGS=(
+            O=out
+            ARCH=arm64
+            CC="$CC_CMD"
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            DTC_EXT="$(which dtc)"
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32="$ARM32_PREFIX"
+            CROSS_COMPILE_COMPAT="$ARM32_PREFIX"
+          )
+
+          echo ">>> Building Image.gz-dtb ..."
+          make -j"$(nproc)" "${MAKE_ARGS[@]}" Image.gz-dtb 2>&1 | tee /tmp/build.log
+
+          # Juga pastikan Image.gz, dtbs, dan dtbo.img (jika didukung) tersedia untuk Header v2 / fastboot boot
+          make -j"$(nproc)" "${MAKE_ARGS[@]}" Image.gz dtbs 2>&1 | tee -a /tmp/build.log || true
+          make -j"$(nproc)" "${MAKE_ARGS[@]}" dtbo.img 2>&1 | tee -a /tmp/build.log || true
+
+          KSU_VER_LINE=$(grep -m 1 -iE "KernelSU.*version:" /tmp/build.log || echo "N/A")
+          echo "KSU_VER_LINE=$KSU_VER_LINE" >> "$GITHUB_ENV"
+          echo ">>> Detected KernelSU build log line: $KSU_VER_LINE"
+
+          [ "${{ inputs.use_ccache }}" = "true" ] && ccache -s || true
+          echo "=== Output Files ==="
+          find out/arch/arm64/boot -maxdepth 4 -type f \( -name "Image*" -o -name "*.dtb" -o -name "*.dtbo" -o -name "dtbo.img" \) -ls
+
+      - name: "[12/12] Kemas Smart AnyKernel3 ZIP (Android 16 / split_boot) & Raw Boot Payload"
+        shell: bash
+        run: |
+          set -euo pipefail
+          AK_DIR="AnyKernel3_out"
+          RAW_DIR="raw_boot_payload"
+          rm -rf "$AK_DIR" "$RAW_DIR"
+          mkdir -p "$RAW_DIR"
+
+          # Tentukan apakah DTB perlu di-update di HP (otomatis YA jika GPU OC atau Display OC aktif!)
+          UPDATE_DTB=0
+          case "${{ inputs.update_dtb_in_zip }}" in
+            always)
+              UPDATE_DTB=1
+              ;;
+            kernel-only)
+              UPDATE_DTB=0
+              ;;
+            auto)
+              if [ "${{ inputs.gpu_oc_profile }}" != "stock-950" ] || [ "${{ inputs.tianma_display_hz }}" != "60" ]; then
+                UPDATE_DTB=1
+              else
+                UPDATE_DTB=0
+              fi
+              ;;
+          esac
+
+          # Siapkan raw payload untuk AnyKernel3 DAN untuk pengguna magiskboot/fastboot boot
+          [ -f out/arch/arm64/boot/Image.gz-dtb ] && cp -f out/arch/arm64/boot/Image.gz-dtb "$RAW_DIR/"
+          [ -f out/arch/arm64/boot/Image.gz ] && cp -f out/arch/arm64/boot/Image.gz "$RAW_DIR/"
+          cp -f out/.config "$RAW_DIR/kernel.config"
+
+          DTB_FILES=$(find out/arch/arm64/boot/dts -type f -name "*trinket*.dtb" | sort || true)
+          if [ -n "$DTB_FILES" ]; then
+            cat $DTB_FILES > "$RAW_DIR/dtb"
+            echo "Combined DTB from: $DTB_FILES"
+          fi
+
+          if [ -f out/arch/arm64/boot/dtbo.img ]; then
+            cp -f out/arch/arm64/boot/dtbo.img "$RAW_DIR/dtbo.img"
+          else
+            DTBO_FILES=$(find out/arch/arm64/boot/dts -type f \( -name "*ginkgo*overlay*.dtbo" -o -name "*trinket*overlay*.dtbo" \) | sort || true)
+            if [ -n "$DTBO_FILES" ]; then
+              python3 "$HOME/tools/mkdtboimg.py" create "$RAW_DIR/dtbo.img" --page_size=4096 $DTBO_FILES
+              echo "Wrapped DTBO into dtbo.img from: $DTBO_FILES"
+            fi
+          fi
+
+          if [ ! -f "$RAW_DIR/Image.gz-dtb" ] && [ ! -f "$RAW_DIR/Image.gz" ]; then
+            echo "::error::Image.gz-dtb maupun Image.gz tidak ditemukan!"
+            exit 1
+          fi
+
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$AK_DIR"
+          rm -rf "$AK_DIR/.git" "$AK_DIR/README.md"
+          mkdir -p "$AK_DIR/payload"
+          cp -f "$RAW_DIR"/Image* "$AK_DIR/payload/" 2>/dev/null || true
+          [ -f "$RAW_DIR/dtb" ] && cp -f "$RAW_DIR/dtb" "$AK_DIR/payload/"
+          [ -f "$RAW_DIR/dtbo.img" ] && cp -f "$RAW_DIR/dtbo.img" "$AK_DIR/payload/"
+
+          cat <<EOF > "$AK_DIR/anykernel.sh"
+          ### AnyKernel3 Smart Script — Redmi Note 8 / 8T (ginkgo / willow) Android 16
+          ### Ramdisk dibiarkan 100% utuh (split_boot + flash_boot), auto-deteksi Header v1 vs v2!
+          properties() { '
+          kernel.string=Ginkgo Brutal FlopUnity (${{ inputs.gpu_oc_profile }} | ${{ inputs.tianma_display_hz }}Hz | HZ=${{ inputs.kernel_hz }})
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=ginkgo
+          device.name2=willow
+          supported.versions=
+          supported.patchlevels=
+          '; }
+
+          block=/dev/block/bootdevice/by-name/boot;
+          is_slot_device=0;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+
+          . tools/ak3-core.sh;
+
+          # Bongkar boot.img TANPA menyentuh ramdisk Android 16
+          split_boot;
+
+          UPDATE_DTB=${UPDATE_DTB}
+
+          if [ -f "\$split_img/dtb" ] || [ -f "\$split_img/kernel_dtb" ]; then
+            ui_print "  [GinkgoBrutal] Boot Header v2 terdeteksi (DTB terpisah)";
+            if [ -f "\$home/payload/Image.gz" ]; then
+              cp -f "\$home/payload/Image.gz" "\$home/Image.gz";
+            else
+              cp -f "\$home/payload/Image.gz-dtb" "\$home/Image.gz-dtb";
+            fi;
+            if [ "\$UPDATE_DTB" = "1" ]; then
+              ui_print "  [GinkgoBrutal] Mengupdate DTB/DTBO (GPU/Display OC aktif)";
+              [ -f "\$home/payload/dtb" ] && cp -f "\$home/payload/dtb" "\$home/dtb";
+              [ -f "\$home/payload/dtbo.img" ] && cp -f "\$home/payload/dtbo.img" "\$home/dtbo.img";
+            else
+              ui_print "  [GinkgoBrutal] Mempertahankan DTB bawaan ROM (Mode Aman FlashHouseLab)";
+            fi;
+          else
+            ui_print "  [GinkgoBrutal] Boot Header v1 terdeteksi (Image.gz-dtb)";
+            cp -f "\$home/payload/Image.gz-dtb" "\$home/Image.gz-dtb";
+            if [ "\$UPDATE_DTB" = "1" ] && [ -f "\$home/payload/dtbo.img" ]; then
+              cp -f "\$home/payload/dtbo.img" "\$home/dtbo.img";
+            fi;
+          fi;
+
+          flash_boot;
+          EOF
+
+          BUILD_DATE=$(date +%Y%m%d-%H%M)
+          TAG_SFX="${{ inputs.gpu_oc_profile }}-${{ inputs.tianma_display_hz }}Hz-HZ${{ inputs.kernel_hz }}"
+          ZIP_NAME="GinkgoBrutal-FlopUnity-${TAG_SFX}-${BUILD_DATE}.zip"
+          (
+            cd "$AK_DIR"
+            zip -r9 -n .gz:.gz-dtb "../$ZIP_NAME" * -x '*placeholder'
+          )
+          python3 -m zipfile -t "$ZIP_NAME"
+          sha256sum "$ZIP_NAME" | tee "${ZIP_NAME}.sha256"
+
+          RESOLVED_HZ=$(grep -E '^CONFIG_HZ=' out/.config | cut -d= -f2 || echo "?")
+          {
+            echo "## Ginkgo Brutal FlopUnity Android 16 Build Selesai!"
+            echo ""
+            echo "| Parameter | Nilai |"
+            echo "|---|---|"
+            echo "| File ZIP (OrangeFox/TWRP) | \`$ZIP_NAME\` |"
+            echo "| Defconfig Sources | \`$MERGED_SOURCES\` |"
+            echo "| KernelSU Mode | \`${{ inputs.ksu_mode }}\` |"
+            echo "| KernelSU Build Log | \`$KSU_VER_LINE\` |"
+            echo "| Compiler | \`${{ inputs.clang_version }}\` + \`$ARM32_PREFIX\` |"
+            echo "| Kernel Tick Rate | \`${RESOLVED_HZ} Hz\` |"
+            echo "| GPU Adreno 610 Profile | \`${{ inputs.gpu_oc_profile }}\` |"
+            echo "| Tianma Display OC | \`${{ inputs.tianma_display_hz }} Hz\` |"
+            echo "| Update DTB di ZIP | \`$([ "$UPDATE_DTB" = "1" ] && echo YA || echo TIDAK_DTB_STOCK_ROM)\` |"
+            echo "| LOCALVERSION | \`${{ inputs.localversion }}\` |"
+            echo "| SHA256 ZIP | \`$(awk '{print $1}' "${ZIP_NAME}.sha256")\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Flashable AnyKernel3 ZIP & Raw Boot Payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: GinkgoBrutal-FlopUnity-${{ inputs.gpu_oc_profile }}-${{ inputs.tianma_display_hz }}Hz
+          path: |
+            GinkgoBrutal-FlopUnity-*.zip
+            GinkgoBrutal-FlopUnity-*.zip.sha256
+            raw_boot_payload/
+          retention-days: 30
