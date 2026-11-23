@@ -157,88 +157,146 @@ jobs:
 
       - name: "[5/8] Opsional: Patch GPU Adreno 610 OC+UV & Tianma Display OC"
         working-directory: kernel
-        shell: bash
+        shell: python3 {0}
+        env:
+          GPU: ${{ inputs.gpu_oc_profile }}
+          HZ: ${{ inputs.tianma_display_hz }}
         run: |
-          set -euo pipefail
-          GPU="${{ inputs.gpu_oc_profile }}"
-          HZ="${{ inputs.tianma_display_hz }}"
-
-          if [ "$GPU" != "stock-950" ]; then
-            python3 - "$GPU" <<'PY'
-          import re, sys
+          import os, re, subprocess
           from pathlib import Path
 
-          prof = sys.argv[1]
-          max_f = 1050000000 if prof == "oc-1050-uv" else 1100000000
+          prof = os.environ["GPU"]
+          hz = int(os.environ["HZ"])
 
-          gpucc = Path("drivers/clk/qcom/gpucc-trinket.c")
-          src = gpucc.read_text()
-          def add_ftbl(m):
-              b = m.group(0)
-              m950 = re.search(r'([ \t]*F\()950000000(\s*,\s*)([A-Z0-9_]+)(\s*,\s*)\d+(\s*,\s*0\s*,\s*0\s*\),[^\n]*\n)', b)
-              assert m950, "950MHz tidak ditemukan di ftbl"
-              indent_f, c1, parent, c2, tail = m950.groups()
-              ins = ""
-              if "1050000000" not in b:
-                  ins += f"{indent_f}1050000000{c1}{parent}{c2}1{tail}"
-              if max_f >= 1100000000 and "1100000000" not in b:
-                  ins += f"{indent_f}1100000000{c1}{parent}{c2}1{tail}"
-              return b[:m950.end()] + ins + b[m950.end():]
-          src, n1 = re.subn(r'static const struct freq_tbl ftbl_gpu_cc_gx_gfx3d_clk_src\[\]\s*=\s*\{.*?\};', add_ftbl, src, count=1, flags=re.S)
-          assert n1 == 1, "ftbl_gpu_cc_gx_gfx3d_clk_src tidak ditemukan"
+          def gx(txt, k):
+              m = re.search(rf'qcom,{k}\s*=\s*<\s*(\d+)\s*>;', txt)
+              return m.group(1) if m else None
 
-          def fix_rcg(m):
-              b = re.sub(r'(\[VDD_NOMINAL_L1\]\s*=\s*)\d+', r'\g<1>950000000', m.group(0))
-              b, c = re.subn(r'(\[VDD_HIGH\]\s*=\s*)\d+', rf'\g<1>{max_f}', b)
-              b = re.sub(r'(\[VDD_HIGH_L1\]\s*=\s*)\d+', rf'\g<1>{max_f}', b)
-              assert c >= 1, "VDD_HIGH tidak ditemukan"
-              return b
-          src, n2 = re.subn(r'static struct clk_rcg2 gpu_cc_gx_gfx3d_clk_src\s*=\s*\{.*?\n\};', fix_rcg, src, count=1, flags=re.S)
-          assert n2 == 1, "gpu_cc_gx_gfx3d_clk_src tidak ditemukan"
-          gpucc.write_text(src)
+          if prof != "stock-950":
+              max_f = 1050000000 if prof == "oc-1050-uv" else 1100000000
+              gpucc = Path("drivers/clk/qcom/gpucc-trinket.c")
+              src = gpucc.read_text()
 
-          def patch_blk(blk):
-              lvls = list(re.finditer(r'qcom,gpu-pwrlevel[-@](\d+)\s*\{[^}]*\};', blk, flags=re.S))
-              active = []
-              for m in lvls:
-                  txt = m.group(0)
-                  fm = re.search(r'qcom,gpu-freq\s*=\s*<\s*(\d+)\s*>;', txt)
-                  if not fm:
+              def add_ftbl(m):
+                  b = m.group(0)
+                  m950 = re.search(r'([ \t]*F\()950000000(\s*,\s*)([A-Z0-9_]+)(\s*,\s*)\d+(\s*,\s*0\s*,\s*0\s*\),[^\n]*\n)', b)
+                  assert m950, "950MHz tidak ditemukan di ftbl"
+                  ind_f, c1, parent, c2, tail = m950.groups()
+                  ins = ""
+                  if "1050000000" not in b:
+                      ins += f"{ind_f}1050000000{c1}{parent}{c2}1{tail}"
+                  if max_f >= 1100000000 and "1100000000" not in b:
+                      ins += f"{ind_f}1100000000{c1}{parent}{c2}1{tail}"
+                  return b[:m950.end()] + ins + b[m950.end():]
+
+              src, n1 = re.subn(r'static const struct freq_tbl ftbl_gpu_cc_gx_gfx3d_clk_src\[\]\s*=\s*\{.*?\};', add_ftbl, src, count=1, flags=re.S)
+              assert n1 == 1, "ftbl_gpu_cc_gx_gfx3d_clk_src tidak ditemukan"
+
+              def fix_rcg(m):
+                  b = re.sub(r'(\[VDD_NOMINAL_L1\]\s*=\s*)\d+', r'\g<1>950000000', m.group(0))
+                  b, c = re.subn(r'(\[VDD_HIGH\]\s*=\s*)\d+', rf'\g<1>{max_f}', b)
+                  b = re.sub(r'(\[VDD_HIGH_L1\]\s*=\s*)\d+', rf'\g<1>{max_f}', b)
+                  assert c >= 1, "VDD_HIGH tidak ditemukan"
+                  return b
+
+              src, n2 = re.subn(r'static struct clk_rcg2 gpu_cc_gx_gfx3d_clk_src\s*=\s*\{.*?\n\};', fix_rcg, src, count=1, flags=re.S)
+              assert n2 == 1, "gpu_cc_gx_gfx3d_clk_src tidak ditemukan"
+              gpucc.write_text(src)
+
+              def patch_blk(blk):
+                  active = []
+                  for m in re.finditer(r'qcom,gpu-pwrlevel[-@](\d+)\s*\{[^}]*\};', blk, flags=re.S):
+                      txt = m.group(0)
+                      f_str = gx(txt, "gpu-freq")
+                      if not f_str or int(f_str) == 0:
+                          continue
+                      active.append((m, int(f_str), gx(txt, "bus-freq"), gx(txt, "bus-min"), gx(txt, "bus-max")))
+                  if not active or not any(x[1] == 950000000 for x in active):
+                      return blk, False
+                  top = active[0][2:5]
+                  oc = [(1050000000, *top)] if prof == "oc-1050-uv" else [(1100000000, *top), (1050000000, *top)]
+                  new_vals = (oc + [x[1:5] for x in active if x[1] < 1050000000])[:len(active)]
+                  parts, pos = [], 0
+                  for (m, *_), (nf, nbf, nbn, nbx) in zip(active, new_vals):
+                      parts.append(blk[pos:m.start()])
+                      t = re.sub(r'(qcom,gpu-freq\s*=\s*<\s*)\d+(\s*>;)', rf'\g<1>{nf}\g<2>', m.group(0), count=1)
+                      for k, v in (("bus-freq", nbf), ("bus-min", nbn), ("bus-max", nbx)):
+                          if v is not None:
+                              t = re.sub(rf'(qcom,{k}\s*=\s*<\s*)\d+(\s*>;)', rf'\g<1>{v}\g<2>', t, count=1)
+                      parts.append(t)
+                      pos = m.end()
+                  parts.append(blk[pos:])
+                  return "".join(parts), True
+
+              def patch_opp(t):
+                  m = re.search(r'([ \t]*)opp-950000000\s*\{([^}]*)\};', t, flags=re.S)
+                  if not m or "opp-1050000000" in t:
+                      return t
+                  ind, body = m.group(1), m.group(2)
+                  extra = f"{ind}opp-1100000000 {{{body.replace('950000000', '1100000000')}}};\n" if max_f >= 1100000000 else ""
+                  extra += f"{ind}opp-1050000000 {{{body.replace('950000000', '1050000000')}}};\n"
+                  return t[:m.start()] + extra + t[m.start():]
+
+              patched = 0
+              for dts in sorted(Path("arch/arm64/boot/dts").rglob("*.dts*")):
+                  t = dts.read_text(errors="ignore")
+                  if not re.search(r'qcom,gpu-pwrlevel[-@]0\b', t) or "950000000" not in t:
                       continue
-                  f = int(fm.group(1))
-                  if f == 0:
-                      continue
-                  bf = re.search(r'qcom,bus-freq\s*=\s*<\s*(\d+)\s*>;', txt)
-                  bn = re.search(r'qcom,bus-min\s*=\s*<\s*(\d+)\s*>;', txt)
-                  bx = re.search(r'qcom,bus-max\s*=\s*<\s*(\d+)\s*>;', txt)
-                  active.append((m, f, bf.group(1) if bf else None, bn.group(1) if bn else None, bx.group(1) if bx else None))
-              if not active or not any(x[1] == 950000000 for x in active):
-                  return blk, False
-              top_bf, top_bn, top_bx = active[0][2], active[0][3], active[0][4]
-              oc_list = [(1050000000, top_bf, top_bn, top_bx)] if prof == "oc-1050-uv" \
-                  else [(1100000000, top_bf, top_bn, top_bx), (1050000000, top_bf, top_bn, top_bx)]
-              orig_vals = [(f, bf, bn, bx) for _, f, bf, bn, bx in active if f < 1050000000]
-              new_vals = (oc_list + orig_vals)[:len(active)]
-              parts, pos = [], 0
-              for (m, _, _, _, _), (nf, nbf, nbn, nbx) in zip(active, new_vals):
-                  parts.append(blk[pos:m.start()])
-                  t = m.group(0)
-                  t = re.sub(r'(qcom,gpu-freq\s*=\s*<\s*)\d+(\s*>;)', rf'\g<1>{nf}\g<2>', t, count=1)
-                  if nbf is not None:
-                      t = re.sub(r'(qcom,bus-freq\s*=\s*<\s*)\d+(\s*>;)', rf'\g<1>{nbf}\g<2>', t, count=1)
-                  if nbn is not None:
-                      t = re.sub(r'(qcom,bus-min\s*=\s*<\s*)\d+(\s*>;)', rf'\g<1>{nbn}\g<2>', t, count=1)
-                  if nbx is not None:
-                      t = re.sub(r'(qcom,bus-max\s*=\s*<\s*)\d+(\s*>;)', rf'\g<1>{nbx}\g<2>', t, count=1)
-                  parts.append(t)
-                  pos = m.end()
-              parts.append(blk[pos:])
-              return "".join(parts), True
+                  t = re.sub(r'^([ \t]*)(qcom,gpu-gaming-bin;)', r'\1/* \2 */', patch_opp(t), flags=re.M)
+                  out, pos, any_ok = [], 0, False
+                  for m in re.finditer(r'qcom,gpu-pwrlevels(?:[-@]\d+)?\s*\{', t):
+                      if m.start() < pos:
+                          continue
+                      s = t.find("{", m.start())
+                      d, e = 0, s
+                      while e < len(t):
+                          d += (t[e] == "{") - (t[e] == "}")
+                          e += 1
+                          if d == 0:
+                              e += int(e < len(t) and t[e] == ";")
+                              break
+                      out.append(t[pos:m.start()])
+                      nb, ok = patch_blk(t[m.start():e])
+                      any_ok |= ok
+                      out.append(nb)
+                      pos = e
+                  out.append(t[pos:])
+                  if any_ok:
+                      dts.write_text("".join(out))
+                      print(f"Patched GPU DTSI: {dts}")
+                      patched += 1
+              if patched == 0:
+                  for dts in sorted(Path("arch/arm64/boot/dts").rglob("*.dts*")):
+                      t = dts.read_text(errors="ignore")
+                      if "qcom,gpu-freq" in t or "gpu-pwrlevel" in t:
+                          print(f"DEBUG {dts}:")
+                          for ln in t.splitlines():
+                              if any(k in ln for k in ("pwrlevel", "gpu-freq", "950000000", "opp-")):
+                                  print(" ", ln.strip())
+                  raise AssertionError("trinket-gpu.dtsi tidak ter-patch!")
 
-          def patch_opp_table(t):
-              m = re.search(r'([ \t]*)opp-950000000\s*\{([^}]*)\};', t, flags=re.S)
-              if not m or "opp-10500
+          if hz != 60:
+              cnt = 0
+              for f in sorted(Path("arch/arm64/boot/dts").rglob("*.dts*")):
+                  t = f.read_text(errors="ignore")
+                  nl, tl = f.name.lower(), t.lower()
+                  if (("nt36672a" in nl and "tianma" in nl) or "dsi_nt36672a_tianma" in tl or ("nt36672a" in tl and "tianma" in tl)) \
+                     and "qcom,mdss-dsi-panel-framerate" in t:
+                      nt = re.sub(r'(qcom,mdss-dsi-panel-framerate\s*=\s*<\s*)60(\s*>;)', rf'\g<1>{hz}\g<2>', t)
+                      nt = re.sub(r'(qcom,mdss-dsi-(?:panel-clockrate|bitclock-frequency)\s*=\s*<\s*)(\d+)(\s*>;)',
+                          lambda m: f"{m.group(1)}{int(round(int(m.group(2)) * hz / 60.0))}{m.group(3)}" if int(m.group(2)) > 0 else m.group(0), nt)
+                      if nt != t:
+                          f.write_text(nt)
+                          print(f"Patched Tianma DTSI ({hz}Hz): {f}")
+                          cnt += 1
+              if cnt == 0:
+                  for f in sorted(Path("arch/arm64/boot/dts").rglob("*.dts*")):
+                      if "nt36672a" in f.name.lower() or "tianma" in f.name.lower():
+                          print("DEBUG PANEL:", f)
+                  raise AssertionError("Panel Tianma NT36672A tidak ditemukan!")
 
+          subprocess.run(["git", "diff", "drivers/clk/qcom/gpucc-trinket.c", "arch/arm64/boot/dts/"], check=False)
+          
       - name: "[6/8] Konfigurasi Defconfig Ginkgo + Flag Resep Terbukti"
         working-directory: kernel
         shell: bash
