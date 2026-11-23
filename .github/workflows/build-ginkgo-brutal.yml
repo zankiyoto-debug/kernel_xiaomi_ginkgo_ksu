@@ -109,33 +109,28 @@ jobs:
           git -C "$KSUN" checkout v3.4.0-legacy
           echo "KSUN commit count: $(git -C "$KSUN" rev-list --count HEAD)"
 
-          # Deteksi subdir KSU_NEXT di drivers/Makefile FlopKernel
-          KSU_DIR=$(python3 - <<'PY'
-          import re
-          from pathlib import Path
-          mk = Path("drivers/Makefile").read_text(errors="ignore")
-          m = re.search(r'obj-\$\(CONFIG_KSU_NEXT\)\s*\+=\s*([A-Za-z0-9_.-]+)/', mk) or \
-              re.search(r'obj-\$\(CONFIG_KSU\)\s*\+=\s*([A-Za-z0-9_.-]+)/', mk)
-          print(m.group(1) if m else "kernelsu")
-          PY
-          )
-          echo "Target KSU subdir: drivers/$KSU_DIR"
-          rm -rf "drivers/$KSU_DIR"
-          ln -s "$KSUN/kernel" "drivers/$KSU_DIR"
-
-          if ! grep -qE "obj-\\\$\(CONFIG_KSU(_NEXT)?\).*${KSU_DIR}/" drivers/Makefile; then
-            printf '\nobj-$(CONFIG_KSU) += %s/\n' "$KSU_DIR" >> drivers/Makefile
-          fi
-          if ! grep -rq "drivers/${KSU_DIR}/Kconfig" Kconfig drivers/ init/ security/ 2>/dev/null; then
-            python3 - "$KSU_DIR" <<'PY'
-          import sys
+          # Cek layout FlopKernel (drivers/su_variants.Kconfig memakai drivers/kernelsu/kernel/Kconfig!)
+          if grep -rq "drivers/kernelsu/kernel/Kconfig" drivers/ Kconfig 2>/dev/null; then
+            echo "Detected FlopKernel layout: drivers/kernelsu -> $KSUN (root repo)"
+            rm -rf drivers/kernelsu
+            ln -s "$KSUN" drivers/kernelsu
+            [ -f drivers/su_variants.Kconfig ] && cat drivers/su_variants.Kconfig || true
+          else
+            echo "Detected standard layout: drivers/kernelsu -> $KSUN/kernel"
+            rm -rf drivers/kernelsu
+            ln -s "$KSUN/kernel" drivers/kernelsu
+            grep -qE 'obj-\$\(CONFIG_KSU(_NEXT)?\).*kernelsu/' drivers/Makefile || \
+              printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+            if ! grep -rq 'drivers/kernelsu/Kconfig' Kconfig drivers/ init/ security/ 2>/dev/null; then
+              python3 - <<'PY'
           from pathlib import Path
           p = Path("drivers/Kconfig")
           txt = p.read_text()
-          line = f'source "drivers/{sys.argv[1]}/Kconfig"\n'
+          line = 'source "drivers/kernelsu/Kconfig"\n'
           i = txt.rfind("endmenu")
           p.write_text((txt[:i] + line + txt[i:]) if i != -1 else (txt + "\n" + line))
           PY
+            fi
           fi
 
           # Patch #1: sulog/event.c (Linux < 4.19)
