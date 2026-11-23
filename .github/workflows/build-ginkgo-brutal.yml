@@ -175,93 +175,69 @@ jobs:
           src = gpucc.read_text()
           def add_ftbl(m):
               b = m.group(0)
-              ins = "\tF(1050000000, P_GPU_CC_PLL0_OUT_AUX2, 1, 0, 0),\n"
-              if max_f >= 1100000000:
-                  ins += "\tF(1100000000, P_GPU_CC_PLL0_OUT_AUX2, 1, 0, 0),\n"
+              m950 = re.search(r'([ \t]*F\()950000000(\s*,\s*)([A-Z0-9_]+)(\s*,\s*)\d+(\s*,\s*0\s*,\s*0\s*\),[^\n]*\n)', b)
+              assert m950, "950MHz tidak ditemukan di ftbl"
+              indent_f, c1, parent, c2, tail = m950.groups()
+              ins = ""
               if "1050000000" not in b:
-                  b, c = re.subn(r'([ \t]*F\(950000000,[^\n]+\n)', r'\1' + ins, b, count=1)
-                  assert c == 1, "950MHz tidak ditemukan di ftbl"
-              return b
+                  ins += f"{indent_f}1050000000{c1}{parent}{c2}1{tail}"
+              if max_f >= 1100000000 and "1100000000" not in b:
+                  ins += f"{indent_f}1100000000{c1}{parent}{c2}1{tail}"
+              return b[:m950.end()] + ins + b[m950.end():]
           src, n1 = re.subn(r'static const struct freq_tbl ftbl_gpu_cc_gx_gfx3d_clk_src\[\]\s*=\s*\{.*?\};', add_ftbl, src, count=1, flags=re.S)
           assert n1 == 1, "ftbl_gpu_cc_gx_gfx3d_clk_src tidak ditemukan"
 
           def fix_rcg(m):
               b = re.sub(r'(\[VDD_NOMINAL_L1\]\s*=\s*)\d+', r'\g<1>950000000', m.group(0))
               b, c = re.subn(r'(\[VDD_HIGH\]\s*=\s*)\d+', rf'\g<1>{max_f}', b)
+              b = re.sub(r'(\[VDD_HIGH_L1\]\s*=\s*)\d+', rf'\g<1>{max_f}', b)
               assert c >= 1, "VDD_HIGH tidak ditemukan"
               return b
           src, n2 = re.subn(r'static struct clk_rcg2 gpu_cc_gx_gfx3d_clk_src\s*=\s*\{.*?\n\};', fix_rcg, src, count=1, flags=re.S)
           assert n2 == 1, "gpu_cc_gx_gfx3d_clk_src tidak ditemukan"
           gpucc.write_text(src)
 
-          freqs = [1050000000, 950000000, 820000000, 745000000, 600000000, 465000000, 320000000] if prof == "oc-1050-uv" \
-             else [1100000000, 1050000000, 950000000, 820000000, 745000000, 600000000, 465000000]
-
           def patch_blk(blk):
-              if "950000000" not in blk:
-                  return blk, False
-              ok = False
-              for i, f in enumerate(freqs):
-                  blk, c = re.subn(rf'(qcom,gpu-pwrlevel-{i}\s*\{{[^}}]*?qcom,gpu-freq\s*=\s*<)\d+(>;)', rf'\g<1>{f}\g<2>', blk, count=1, flags=re.S)
-                  ok = ok or bool(c)
-                  if f >= 1050000000:
-                      blk = re.sub(rf'qcom,gpu-pwrlevel-{i}\s*\{{[^}}]*?\}};',
-                          lambda pm: re.sub(r'(qcom,bus-(?:freq|min|max)\s*=\s*<)\d+(>;)', r'\g<1>11\g<2>', pm.group(0)),
-                          blk, count=1, flags=re.S)
-              return blk, ok
-
-          patched = 0
-          for dts in sorted(Path("arch/arm64/boot/dts").rglob("*.dts*")):
-              t = dts.read_text(errors="ignore")
-              if "qcom,gpu-pwrlevel-0" not in t or "950000000" not in t:
-                  continue
-              t = re.sub(r'^([ \t]*)(qcom,gpu-gaming-bin;)', r'\1/* \2 */', t, flags=re.M)
-              out, pos, any_ok = [], 0, False
-              for m in re.finditer(r'qcom,gpu-pwrlevels(?:-\d+)?\s*\{', t):
-                  if m.start() < pos:
+              lvls = list(re.finditer(r'qcom,gpu-pwrlevel[-@](\d+)\s*\{[^}]*\};', blk, flags=re.S))
+              active = []
+              for m in lvls:
+                  txt = m.group(0)
+                  fm = re.search(r'qcom,gpu-freq\s*=\s*<\s*(\d+)\s*>;', txt)
+                  if not fm:
                       continue
-                  s = t.find("{", m.start())
-                  d, e = 0, s
-                  while e < len(t):
-                      d += (t[e] == "{") - (t[e] == "}")
-                      e += 1
-                      if d == 0:
-                          if e < len(t) and t[e] == ";":
-                              e += 1
-                          break
-                  out.append(t[pos:m.start()])
-                  nb, ok = patch_blk(t[m.start():e])
-                  any_ok = any_ok or ok
-                  out.append(nb)
-                  pos = e
-              out.append(t[pos:])
-              if any_ok:
-                  dts.write_text("".join(out))
-                  patched += 1
-          assert patched > 0, "trinket-gpu.dtsi tidak ter-patch!"
-          PY
-          fi
+                  f = int(fm.group(1))
+                  if f == 0:
+                      continue
+                  bf = re.search(r'qcom,bus-freq\s*=\s*<\s*(\d+)\s*>;', txt)
+                  bn = re.search(r'qcom,bus-min\s*=\s*<\s*(\d+)\s*>;', txt)
+                  bx = re.search(r'qcom,bus-max\s*=\s*<\s*(\d+)\s*>;', txt)
+                  active.append((m, f, bf.group(1) if bf else None, bn.group(1) if bn else None, bx.group(1) if bx else None))
+              if not active or not any(x[1] == 950000000 for x in active):
+                  return blk, False
+              top_bf, top_bn, top_bx = active[0][2], active[0][3], active[0][4]
+              oc_list = [(1050000000, top_bf, top_bn, top_bx)] if prof == "oc-1050-uv" \
+                  else [(1100000000, top_bf, top_bn, top_bx), (1050000000, top_bf, top_bn, top_bx)]
+              orig_vals = [(f, bf, bn, bx) for _, f, bf, bn, bx in active if f < 1050000000]
+              new_vals = (oc_list + orig_vals)[:len(active)]
+              parts, pos = [], 0
+              for (m, _, _, _, _), (nf, nbf, nbn, nbx) in zip(active, new_vals):
+                  parts.append(blk[pos:m.start()])
+                  t = m.group(0)
+                  t = re.sub(r'(qcom,gpu-freq\s*=\s*<\s*)\d+(\s*>;)', rf'\g<1>{nf}\g<2>', t, count=1)
+                  if nbf is not None:
+                      t = re.sub(r'(qcom,bus-freq\s*=\s*<\s*)\d+(\s*>;)', rf'\g<1>{nbf}\g<2>', t, count=1)
+                  if nbn is not None:
+                      t = re.sub(r'(qcom,bus-min\s*=\s*<\s*)\d+(\s*>;)', rf'\g<1>{nbn}\g<2>', t, count=1)
+                  if nbx is not None:
+                      t = re.sub(r'(qcom,bus-max\s*=\s*<\s*)\d+(\s*>;)', rf'\g<1>{nbx}\g<2>', t, count=1)
+                  parts.append(t)
+                  pos = m.end()
+              parts.append(blk[pos:])
+              return "".join(parts), True
 
-          if [ "$HZ" != "60" ]; then
-            python3 - "$HZ" <<'PY'
-          import re, sys
-          from pathlib import Path
-          hz = int(sys.argv[1])
-          cnt = 0
-          for f in sorted(Path("arch/arm64/boot/dts").rglob("*.dts*")):
-              t = f.read_text(errors="ignore")
-              if (("nt36672a" in f.name.lower() and "tianma" in f.name.lower()) or "dsi_nt36672a_tianma_vid" in t) \
-                 and "qcom,mdss-dsi-panel-framerate" in t:
-                  nt = re.sub(r'(qcom,mdss-dsi-panel-framerate\s*=\s*<)60(>;)', rf'\g<1>{hz}\g<2>', t)
-                  nt = re.sub(r'(qcom,mdss-dsi-(?:panel-clockrate|bitclock-frequency)\s*=\s*<)(\d+)(>;)',
-                      lambda m: f"{m.group(1)}{int(round(int(m.group(2)) * hz / 60.0))}{m.group(3)}" if int(m.group(2)) > 0 else m.group(0), nt)
-                  if nt != t:
-                      f.write_text(nt)
-                      cnt += 1
-          assert cnt > 0, "Panel Tianma NT36672A tidak ditemukan!"
-          PY
-          fi
-          git diff --stat || true
+          def patch_opp_table(t):
+              m = re.search(r'([ \t]*)opp-950000000\s*\{([^}]*)\};', t, flags=re.S)
+              if not m or "opp-10500
 
       - name: "[6/8] Konfigurasi Defconfig Ginkgo + Flag Resep Terbukti"
         working-directory: kernel
