@@ -141,10 +141,15 @@ jobs:
           fi
           if [ "${{ inputs.ksu_mode }}" != "none" ]; then
             echo "--- Verifikasi Manual Hook KSU di fs/ ---"
-            if ! grep -rnE "ksu_handle_execveat|ksu_handle_faccessat|ksu_handle_stat|CONFIG_KSU" fs/ | head -n 10; then
+             if [ "${{ inputs.ksu_mode }}" != "none" ]; then
+            echo "--- Verifikasi Manual Hook KSU di fs/ ---"
+            KSU_HITS=$(grep -rnE "ksu_handle_execveat|ksu_handle_faccessat|ksu_handle_stat|CONFIG_KSU" fs/ || true)
+            if [ -z "$KSU_HITS" ]; then
               echo "::error::Tree kernel ini TIDAK memiliki manual hook KernelSU di fs/! Pastikan kernel_source_repo = FlopKernel-Series/flop_trinket-mi_kernel (branch: floppy-unity)."
               exit 1
             fi
+            printf '%s\n' "$KSU_HITS" | sed -n '1,10p'
+            echo "OK: Manual hook KernelSU terverifikasi ada di fs/!"
           fi
 
       - name: "[3/12] Bebaskan Disk & Install Dependensi (+ dwarves/pahole + External DTC)"
@@ -225,7 +230,7 @@ jobs:
           # GCC ARM32 4.9 khusus untuk vdso32 Linux 4.14 (sesuai resep FlashHouseLab)
           if git clone --depth=1 https://github.com/KudProject/arm-linux-androideabi-4.9.git "$HOME/gcc32"; then
             echo "ARM32_PREFIX=$HOME/gcc32/bin/arm-linux-androideabi-" >> "$GITHUB_ENV"
-            "$HOME/gcc32/bin/arm-linux-androideabi-gcc" --version | head -n 1
+            "$HOME/gcc32/bin/arm-linux-androideabi-gcc" --version |             "$HOME/gcc32/bin/arm-linux-androideabi-gcc" --version | sed -n '1p'
           else
             echo "::warning::Clone GCC ARM32 4.9 gagal, fallback ke arm-linux-gnueabi- bawaan Ubuntu."
             echo "ARM32_PREFIX=arm-linux-gnueabi-" >> "$GITHUB_ENV"
