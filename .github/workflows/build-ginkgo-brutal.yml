@@ -1,0 +1,70 @@
+# Fitur v4.0:
+#   1. Resep terbukti FlashHouseLab (100% cocok kernel aktif 4.14.357-openela-perf):
+#      - Clone FULL repo KernelSU-Next v3.4.0-legacy (BUKAN --depth=1) agar versi = 33294
+#      - CONFIG_KSU=y, CONFIG_KSU_NEXT=y, CONFIG_KSU_MANUAL_HOOK=y, CONFIG_KPROBES=n
+#      - Auto-apply 3 patch wajib Clang 20 + Linux 4.14:
+#        (a) sulog/event.c: get_monotonic_boottime() -> get_monotonic_boottime64()
+#        (b) fs/proc/cmdline.c: #include <asm/setup.h>
+#        (c) include/linux/battery_saver.h: () -> (void)
+#      - CONFIG_MODULE_SIG_FORCE=n, CONFIG_MODVERSIONS=y, LOCALVERSION terkunci
+#   2. Upgrade Brutal Creator di atas resep FlashHouseLab:
+#      - Pilihan Tick Rate: 250 Hz (rekomendasi FlopKernel) / 300 Hz / 100 Hz
+#      - TCP BBR/BBR2 + FQ + LZ4 ZRAM + Writeback + MGLRU/BORE (jika tersedia di tree)
+#      - Opsional GPU Adreno 610 OC (1050 / 1100 MHz via PLL0_AUX2 div=1) + GPU UV
+#      - Opsional Display OC khusus panel Tianma NT36672A (65 Hz / 66 Hz + scale clockrate)
+#   3. AnyKernel3 Smart Flasher (split_boot + flash_boot):
+#      - Ramdisk Android 16 dibiarkan 100% utuh byte-for-byte
+#      - Deteksi runtime Header v2 (Image.gz + dtb) vs Header v1 (Image.gz-dtb)
+#      - supported.versions= dikosongkan (lolos Android 16 / SDK 36)
+#      - Sekaligus upload raw payload (Image.gz, Image.gz-dtb, dtb, dtbo.img) untuk tes fastboot boot!
+# ==============================================================================
+name: Build Ginkgo Android 16 Brutal Kernel (v4.0 FlopUnity + KSUN 3.4.0)
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_source_repo:
+        description: "Repo kernel (kosongkan = repo ini; otomatis clone FlopKernel-Series/flop_trinket-mi_kernel jika kosong)"
+        required: false
+        default: ""
+      kernel_source_branch:
+        description: "Branch kernel (default: floppy-unity)"
+        required: false
+        default: "floppy-unity"
+      defconfig_mode:
+        description: "Sumber Defconfig (floppy-auto = optimal FlopKernel; infinityx-stock-file = pakai dump /proc/config.gz)"
+        type: choice
+        required: true
+        default: "floppy-auto"
+        options:
+          - floppy-auto
+          - infinityx-stock-file
+          - custom
+      custom_defconfig:
+        description: "Nama defconfig manual (hanya jika defconfig_mode = custom, misal: vendor/trinket-perf_defconfig vendor/ginkgo.config)"
+        required: false
+        default: ""
+      ksu_mode:
+        description: "Mode KernelSU-Next (ksun-v3.4.0-legacy-manual = RESEP TERBUKTI 33294)"
+        type: choice
+        required: true
+        default: "ksun-v3.4.0-legacy-manual"
+        options:
+          - ksun-v3.4.0-legacy-manual
+          - keep-existing
+          - none
+      clang_version:
+        description: "Compiler AOSP Clang (r547379 = Clang 20.0.0 identik kernel jalan di HP-mu!)"
+        type: choice
+        required: true
+        default: "aosp-clang20-r547379"
+        options:
+          - aosp-clang20-r547379
+          - aosp-clang21-r563880
+          - custom-url
+      custom_clang_url:
+        description: "URL .tar.gz/.tar.xz Clang (hanya jika clang_version = custom-url)"
+        required: false
+        default: ""
+      kernel_hz:
+        description: "Kernel Timer Tick Rate (250 = rekomendasi FlopKernel 2.5x lebih responsif; 100 = stock Infinity X)"
+        type: choice
