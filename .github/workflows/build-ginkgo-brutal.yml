@@ -409,33 +409,38 @@ jobs:
           device.name2=willow
           supported.versions=
           supported.patchlevels=
+          supported.vendorpatchlevels=
           '; }
 
-          block=/dev/block/bootdevice/by-name/boot;
-          is_slot_device=0;
-          ramdisk_compression=auto;
-          patch_vbmeta_flag=auto;
+          BLOCK=boot;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
 
           . tools/ak3-core.sh;
           split_boot;
 
           UPDATE_DTB=${UPDATE_DTB}
-          if [ -f "\$split_img/dtb" ] || [ -f "\$split_img/kernel_dtb" ]; then
-            if [ -f "\$home/payload/Image.gz" ]; then
-              cp -f "\$home/payload/Image.gz" "\$home/Image.gz";
+          if [ -f "\$SPLITIMG/dtb" ] || [ -f "\$SPLITIMG/kernel_dtb" ]; then
+            ui_print "  [GinkgoBrutal] Boot Header v2 terdeteksi";
+            if [ -f "\$AKHOME/payload/Image.gz" ]; then
+              cp -f "\$AKHOME/payload/Image.gz" "\$AKHOME/Image.gz";
             else
-              cp -f "\$home/payload/Image.gz-dtb" "\$home/Image.gz-dtb";
+              cp -f "\$AKHOME/payload/Image.gz-dtb" "\$AKHOME/Image.gz-dtb";
             fi;
             if [ "\$UPDATE_DTB" = "1" ]; then
-              [ -f "\$home/payload/dtb" ] && cp -f "\$home/payload/dtb" "\$home/dtb";
-              [ -f "\$home/payload/dtbo.img" ] && cp -f "\$home/payload/dtbo.img" "\$home/dtbo.img";
+              ui_print "  [GinkgoBrutal] Mengupdate DTB/DTBO untuk GPU/Display OC";
+              [ -f "\$AKHOME/payload/dtb" ] && cp -f "\$AKHOME/payload/dtb" "\$AKHOME/dtb";
+              [ -f "\$AKHOME/payload/dtbo.img" ] && cp -f "\$AKHOME/payload/dtbo.img" "\$AKHOME/dtbo.img";
             fi;
           else
-            cp -f "\$home/payload/Image.gz-dtb" "\$home/Image.gz-dtb";
-            [ "\$UPDATE_DTB" = "1" ] && [ -f "\$home/payload/dtbo.img" ] && cp -f "\$home/payload/dtbo.img" "\$home/dtbo.img";
+            ui_print "  [GinkgoBrutal] Boot Header v1 terdeteksi (Image.gz-dtb)";
+            cp -f "\$AKHOME/payload/Image.gz-dtb" "\$AKHOME/Image.gz-dtb";
+            [ "\$UPDATE_DTB" = "1" ] && [ -f "\$AKHOME/payload/dtbo.img" ] && cp -f "\$AKHOME/payload/dtbo.img" "\$AKHOME/dtbo.img";
           fi;
 
           flash_boot;
+          [ "\$UPDATE_DTB" = "1" ] && [ -f "\$AKHOME/dtbo.img" ] && flash_generic dtbo;
           EOF
 
           ZIP_NAME="GinkgoBrutal-v5-${{ inputs.gpu_oc_profile }}-${{ inputs.tianma_display_hz }}Hz-HZ${{ inputs.kernel_hz }}-$(date +%Y%m%d-%H%M).zip"
